@@ -1,0 +1,41 @@
+Abstract: Modern content recommendation algorithms prioritize engagement over user intent, resulting in static, repetitive, and often fatiguing user feeds. This proposed Manifest V3 browser extension is designed to reclaim user agency by intercepting backend data payloads and reshaping the presentation layer before it renders on the screen.
+
+1. Goals and Objectives
+The primary aim is to build a highly performant, client-side data middleware that sits between a content platform's servers and the user's browser. Specific objectives include:
+- Reclaim Algorithmic Agency: Allow the user to enforce dynamic rules (caps, filters, blocks) that the platform's native algorithms refuse to provide.
+- Maintain UI Integrity: Utilize network data interception rather than DOM-hiding (CSS display: none) to ensure the webpage remains fully populated, avoiding blank spaces and layout shifts.
+- Interrupt Scrolling Loops: Implement temporary friction (e.g., cooldowns) to prevent users from spiraling into repetitive content rabbit holes.
+- Elevate Niche Content: Surface "hidden gems" by structurally demoting content that relies purely on massive, established view counts.
+
+2. Proposed Features
+The following features have been selected for the minimum viable product, utilizing real-time JSON payload modification:
+
+Feature A: Temporary "Snooze" Blocks
+- Mechanism: Instead of permanently banning a video, apply a 5-to-10-minute cooldown to specific videos, channels, or categories (e.g., ASMR, Gaming).
+- Value: Breaks the immediate engagement loop by temporarily filtering out repetitive suggestions, while allowing the content to return in later, organic browsing sessions.
+
+Feature B: Channel Caps and Grouping
+- Mechanism: The extension tracks the density of specific channels within a fetched JSON batch. If a single creator exceeds a user-defined threshold (e.g., "Max 2 videos per channel per refresh"), subsequent videos from that channel are silently dropped from the payload.
+- Value: Forces the native algorithm to fetch deeper into the recommendation queue, mathematically guaranteeing a more diverse content feed.
+
+Feature C: View Velocity ("Hidden Gem" Finder)
+- Mechanism: Parse the metadata strings of incoming videos (e.g., "10K views, 2 hours ago") and calculate a view-velocity metric. Apply a threshold to hide mega-viral content or specifically isolate videos gaining rapid traction relative to their recent upload time.
+- Value: Circumvents the platform's bias toward established creators, enabling the discovery of smaller, highly-engaged channels.
+
+3. Technical Methodology & Stack
+To ensure high performance and maintainability against platform updates, the extension will be built using a modern, deeply-typed architecture.
+
+Stack: WXT Framework, TypeScript, React.js, Tailwind CSS
+
+- Core Engine (WXT Framework): Utilized for its robust Manifest V3 compliance, Hot Module Replacement (HMR) for rapid development, and built-in Chrome Storage wrappers.
+- Data Interception (MAIN World Injection): Standard content scripts (ISOLATED world) cannot modify network requests. The extension will inject a script into the MAIN execution environment to "monkey-patch" window.fetch and XMLHttpRequest, intercepting the raw JSON before the native frontend can process it.
+- Type Safety (TypeScript): Essential for parsing deeply nested, undocumented JSON structures. Interfaces will map the required platform objects, ensuring the extension fails gracefully if the platform updates its data schema.
+- Interface (React + Tailwind): The popup and options pages will be built as lightweight React applications, allowing users to easily configure snooze durations, channel cap limits, and velocity thresholds.
+
+4. Projected Architecture Flow
+When a user refreshes the page:
+1. The native platform fires a fetch() request for new recommendations.
+2. The injected middleware intercepts the response and parses the raw JSON payload.
+3. The data is passed through the evaluation pipeline: Check Snooze DB -> Apply Channel Caps -> Calculate View Velocity.
+4. Non-compliant objects are spliced out of the array.
+5. The sanitized JSON is handed back to the platform's native rendering engine.

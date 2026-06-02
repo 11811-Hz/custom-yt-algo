@@ -1,0 +1,32 @@
+{
+  "name": "custom-yt-algo",
+  "version": "0.1.0",
+  "description": "Reclaim your YouTube feed — snooze, cap, and discover hidden gems",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wxt",
+    "dev:firefox": "wxt -b firefox",
+    "build": "wxt build",
+    "build:firefox": "wxt build -b firefox",
+    "zip": "wxt zip",
+    "zip:firefox": "wxt zip -b firefox",
+    "postinstall": "wxt prepare"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.1.8",
+    "@types/react": "^19.1.4",
+    "@types/react-dom": "^19.1.5",
+    "@wxt-dev/auto-icons": "^1.1.1",
+    "@wxt-dev/module-react": "^1.1.2",
+    "@wxt-dev/storage": "^1.2.8",
+    "autoprefixer": "^10.4.21",
+    "postcss": "^8.5.4",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "sharp": "^0.34.5",
+    "tailwindcss": "^4.1.8",
+    "typescript": "^5.8.3",
+    "wxt": "^0.20.26"
+  }
+}
