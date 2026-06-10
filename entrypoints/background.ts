@@ -9,9 +9,29 @@
 
 import { getSettings, updateSettings, addSnooze, removeSnooze, getActiveSnoozes, incrementStats, resetStats, getStats } from '@/utils/storage';
 import type { ExtensionMessage, ExtensionResponse } from '@/utils/messaging';
+import { checkForUpdateIfDue, checkForUpdate } from '@/utils/updater';
 
 export default defineBackground(() => {
   console.log('[FeedForge] Background service worker started');
+
+  // ── Update Checker ────────────────────────────────────────────────────
+  // Check for updates on startup (respects cache interval)
+  checkForUpdateIfDue().then((info) => {
+    if (info?.available) {
+      console.log(`[FeedForge] Update available: v${info.latestVersion}`);
+    }
+  });
+
+  // Set a repeating alarm to check every 4 hours
+  browser.alarms.create('feedforge-update-check', {
+    periodInMinutes: 4 * 60,
+  });
+
+  browser.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name === 'feedforge-update-check') {
+      checkForUpdate();
+    }
+  });
 
   // ── Message Handler ─────────────────────────────────────────────────────
 
@@ -80,6 +100,11 @@ async function handleMessage(message: ExtensionMessage): Promise<ExtensionRespon
     case 'RESET_STATS': {
       await resetStats();
       return { success: true };
+    }
+
+    case 'CHECK_UPDATE': {
+      const updateInfo = await checkForUpdateIfDue();
+      return { success: true, data: updateInfo };
     }
 
     default:

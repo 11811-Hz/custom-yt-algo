@@ -10,7 +10,7 @@ export default defineConfig({
     name: 'FeedForge — Custom YouTube Algorithm',
     description: 'Reclaim your YouTube feed with snooze blocks, channel caps, and hidden gem discovery.',
     version: '0.1.0',
-    permissions: ['storage'],
+    permissions: ['storage', 'alarms'],
     host_permissions: ['*://*.youtube.com/*'],
     web_accessible_resources: [
       {

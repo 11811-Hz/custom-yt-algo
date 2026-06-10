@@ -1,0 +1,67 @@
+# ─── FeedForge Release Pipeline ──────────────────────────────────────────────
+# Triggered on version tags (v0.1.0, v1.0.0, etc.)
+# Builds the extension, zips the output, and creates a GitHub Release.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Release Extension
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build extension
+        run: npm run build
+
+      - name: Zip extension
+        run: npm run zip
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "FeedForge ${{ steps.version.outputs.VERSION }}"
+          body: |
+            ## 🔧 FeedForge ${{ steps.version.outputs.VERSION }}
+
+            ### Installation
+            1. Download the `.zip` file below
+            2. Extract it to a folder on your computer
+            3. Open `brave://extensions` (or `chrome://extensions`)
+            4. Enable **Developer Mode** (top-right toggle)
+            5. Click **Load unpacked** and select the extracted folder
+            6. Pin FeedForge to your toolbar 📌
+
+            ### Updating
+            If you already have FeedForge installed:
+            1. Download and extract the new `.zip` over the old folder
+            2. Go to your extensions page and click **Reload** on FeedForge
+          files: |
+            .output/*.zip
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

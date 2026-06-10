@@ -16,6 +16,7 @@ export type ExtensionMessage =
   | { type: 'REMOVE_SNOOZE'; payload: { id: string; type: 'video' | 'channel' | 'keyword' } }
   | { type: 'INCREMENT_STATS'; payload: { snoozed?: number; capped?: number; velocity?: number; intercepted?: number } }
   | { type: 'RESET_STATS' }
+  | { type: 'CHECK_UPDATE' }
   | { type: 'PIPELINE_DATA_REQUEST' }
   | { type: 'SETTINGS_CHANGED'; payload: Record<string, unknown> };
 

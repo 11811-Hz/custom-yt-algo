@@ -5,6 +5,7 @@ import Dashboard from './components/Dashboard';
 import SnoozePanel from './components/SnoozePanel';
 import ChannelCapPanel from './components/ChannelCapPanel';
 import VelocityPanel from './components/VelocityPanel';
+import UpdateBanner from './components/UpdateBanner';
 
 type Tab = 'dashboard' | 'snooze' | 'caps' | 'velocity';
 
@@ -198,6 +199,9 @@ export default function App() {
           </button>
         ))}
       </nav>
+
+      {/* ── Update Banner ─────────────────────────────────────────────── */}
+      <UpdateBanner />
 
       {/* ── Disabled Overlay ─────────────────────────────────────────────── */}
       {!settings.enabled && (
