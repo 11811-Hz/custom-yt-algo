@@ -7,8 +7,9 @@
  * - Settings change broadcasting to all YouTube tabs
  */
 
-import { getSettings, updateSettings, addSnooze, removeSnooze, getActiveSnoozes, incrementStats, resetStats, getStats } from '@/utils/storage';
+import { getSettings, updateSettings, addSnooze, removeSnooze, getActiveSnoozes, incrementStats, resetStats, getStats, getSchemaHealth, setSchemaHealth } from '@/utils/storage';
 import type { ExtensionMessage, ExtensionResponse } from '@/utils/messaging';
+import type { SchemaHealth } from '@/utils/types';
 import { checkForUpdateIfDue, checkForUpdate } from '@/utils/updater';
 
 export default defineBackground(() => {
@@ -107,6 +108,25 @@ async function handleMessage(message: ExtensionMessage): Promise<ExtensionRespon
       return { success: true, data: updateInfo };
     }
 
+    case 'REPORT_SCHEMA_HEALTH': {
+      const healthPayload = message.payload as { status: string; issues: string[]; totalChecked: number; consecutiveFailures: number };
+      const health: SchemaHealth = {
+        status: healthPayload.status as SchemaHealth['status'],
+        issues: healthPayload.issues,
+        totalChecked: healthPayload.totalChecked,
+        consecutiveFailures: healthPayload.consecutiveFailures,
+        lastCheckedAt: Date.now(),
+      };
+      await setSchemaHealth(health);
+      await updateBadge(health);
+      return { success: true };
+    }
+
+    case 'GET_SCHEMA_HEALTH': {
+      const health = await getSchemaHealth();
+      return { success: true, data: health };
+    }
+
     default:
       return { success: false, error: `Unknown message type: ${(message as { type: string }).type}` };
   }
@@ -133,5 +153,24 @@ async function broadcastSettingsChange(newSettings: unknown): Promise<void> {
     }
   } catch (error) {
     console.warn('[FeedForge] Failed to broadcast settings change:', error);
+  }
+}
+
+/**
+ * Update the extension icon badge based on schema health status.
+ * Shows "!" for degraded (yellow) or broken (red), clears for healthy.
+ */
+async function updateBadge(health: SchemaHealth): Promise<void> {
+  try {
+    if (health.status === 'healthy') {
+      await browser.action.setBadgeText({ text: '' });
+    } else {
+      await browser.action.setBadgeText({ text: '!' });
+      await browser.action.setBadgeBackgroundColor({
+        color: health.status === 'broken' ? '#ef4444' : '#f59e0b',
+      });
+    }
+  } catch (error) {
+    console.warn('[FeedForge] Failed to update badge:', error);
   }
 }

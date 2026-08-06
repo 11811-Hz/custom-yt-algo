@@ -6,6 +6,7 @@ import SnoozePanel from './components/SnoozePanel';
 import ChannelCapPanel from './components/ChannelCapPanel';
 import VelocityPanel from './components/VelocityPanel';
 import UpdateBanner from './components/UpdateBanner';
+import SchemaWarningBanner from './components/SchemaWarningBanner';
 
 type Tab = 'dashboard' | 'snooze' | 'caps' | 'velocity';
 
@@ -45,6 +46,19 @@ export default function App() {
   useEffect(() => {
     loadData();
   }, [loadData]);
+
+  // Poll for stats updates every 2 seconds while popup is open
+  useEffect(() => {
+    const interval = setInterval(async () => {
+      try {
+        const statsRes = await browser.runtime.sendMessage({ type: 'GET_STATS' });
+        if (statsRes?.data) setStats(statsRes.data as FilterStats);
+      } catch {
+        // ignore
+      }
+    }, 2000);
+    return () => clearInterval(interval);
+  }, []);
 
   // ── Settings Update Handler ─────────────────────────────────────────────
 
@@ -200,8 +214,9 @@ export default function App() {
         ))}
       </nav>
 
-      {/* ── Update Banner ─────────────────────────────────────────────── */}
+      {/* ── Banners ───────────────────────────────────────────────────── */}
       <UpdateBanner />
+      <SchemaWarningBanner />
 
       {/* ── Disabled Overlay ─────────────────────────────────────────────── */}
       {!settings.enabled && (

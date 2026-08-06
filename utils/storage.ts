@@ -3,7 +3,7 @@
  * Uses chrome.storage.local directly for simplicity and compatibility.
  */
 
-import type { FeedForgeSettings, SnoozeEntry, FilterStats } from './types';
+import type { FeedForgeSettings, SnoozeEntry, FilterStats, SchemaHealth } from './types';
 import { DEFAULT_SETTINGS } from './types';
 
 // ─── Storage Keys ───────────────────────────────────────────────────────────
@@ -11,6 +11,7 @@ import { DEFAULT_SETTINGS } from './types';
 const SETTINGS_KEY = 'feedforge-settings';
 const SNOOZE_DB_KEY = 'feedforge-snooze-db';
 const STATS_KEY = 'feedforge-stats';
+const SCHEMA_HEALTH_KEY = 'feedforge-schema-health';
 
 // ─── Default Stats ──────────────────────────────────────────────────────────
 
@@ -132,4 +133,17 @@ export async function incrementStats(increments: {
 /** Reset all stats */
 export async function resetStats(): Promise<void> {
   await setItem(STATS_KEY, { ...DEFAULT_STATS, lastUpdated: Date.now() });
+}
+
+// ─── Schema Health ──────────────────────────────────────────────────────────
+
+/** Get cached schema health status */
+export async function getSchemaHealth(): Promise<SchemaHealth | null> {
+  return getItem<SchemaHealth | null>(SCHEMA_HEALTH_KEY, null);
+}
+
+/** Store schema health status and return it */
+export async function setSchemaHealth(health: SchemaHealth): Promise<SchemaHealth> {
+  await setItem(SCHEMA_HEALTH_KEY, health);
+  return health;
 }

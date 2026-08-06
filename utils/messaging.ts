@@ -17,6 +17,8 @@ export type ExtensionMessage =
   | { type: 'INCREMENT_STATS'; payload: { snoozed?: number; capped?: number; velocity?: number; intercepted?: number } }
   | { type: 'RESET_STATS' }
   | { type: 'CHECK_UPDATE' }
+  | { type: 'REPORT_SCHEMA_HEALTH'; payload: { status: string; issues: string[]; totalChecked: number; consecutiveFailures: number } }
+  | { type: 'GET_SCHEMA_HEALTH' }
   | { type: 'PIPELINE_DATA_REQUEST' }
   | { type: 'SETTINGS_CHANGED'; payload: Record<string, unknown> };
 

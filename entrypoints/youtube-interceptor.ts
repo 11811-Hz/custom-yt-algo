@@ -26,12 +26,51 @@ export default defineUnlistedScript(() => {
     snoozes: Array<Record<string, unknown>>;
   } | null = null;
 
+  /** Schema health tracking */
+  const schemaTracker = {
+    totalChecked: 0,
+    consecutiveFailures: 0,
+    lastStatus: 'healthy' as 'healthy' | 'degraded' | 'broken',
+    lastIssues: [] as string[],
+  };
+
+  /** Dispatch schema health to content script */
+  function dispatchHealthEvent() {
+    const status = schemaTracker.consecutiveFailures === 0
+      ? 'healthy'
+      : schemaTracker.consecutiveFailures < 4
+        ? 'degraded'
+        : 'broken';
+
+    // Only dispatch when status changes or every 10 checks as heartbeat
+    if (status !== schemaTracker.lastStatus || schemaTracker.totalChecked % 10 === 0) {
+      schemaTracker.lastStatus = status;
+      window.dispatchEvent(
+        new CustomEvent('feedforge-main-to-content', {
+          detail: JSON.stringify({
+            type: 'SCHEMA_HEALTH',
+            payload: {
+              status,
+              issues: schemaTracker.lastIssues,
+              totalChecked: schemaTracker.totalChecked,
+              consecutiveFailures: schemaTracker.consecutiveFailures,
+            },
+          }),
+        })
+      );
+    }
+  }
+
   // ─── Listen for config updates from content script ──────────────────────────
 
   window.addEventListener('feedforge-content-to-main', ((event: CustomEvent) => {
-    const data = event.detail;
+    // Detail is JSON-stringified to cross the MAIN/ISOLATED world boundary
+    let data: Record<string, unknown> | null = null;
+    try {
+      data = typeof event.detail === 'string' ? JSON.parse(event.detail) : event.detail;
+    } catch { /* ignore parse errors */ }
     if (data?.type === 'PIPELINE_CONFIG') {
-      pipelineConfig = data.payload;
+      pipelineConfig = data.payload as typeof pipelineConfig;
       console.log('[FeedForge] Pipeline config updated', pipelineConfig);
     }
   }) as EventListener);
@@ -109,7 +148,9 @@ export default defineUnlistedScript(() => {
       expiresAt: number;
     }>;
 
-    let totalFiltered = 0;
+    let totalSnoozed = 0;
+    let totalCapped = 0;
+    let totalVelocity = 0;
 
     // Process the various response structures
     const processed = structuredClone(body);
@@ -140,7 +181,9 @@ export default defineUnlistedScript(() => {
             snoozes
           );
           richGrid.contents = result.items;
-          totalFiltered += result.filtered;
+          totalSnoozed += result.snoozed;
+          totalCapped += result.capped;
+          totalVelocity += result.velocity;
         }
       }
     }
@@ -165,7 +208,9 @@ export default defineUnlistedScript(() => {
             snoozes
           );
           continuationItems.continuationItems = result.items;
-          totalFiltered += result.filtered;
+          totalSnoozed += result.snoozed;
+          totalCapped += result.capped;
+          totalVelocity += result.velocity;
         }
       }
     }
@@ -195,24 +240,179 @@ export default defineUnlistedScript(() => {
         snoozes
       );
       watchNext.results = result.items;
-      totalFiltered += result.filtered;
+      totalSnoozed += result.snoozed;
+      totalCapped += result.capped;
+      totalVelocity += result.velocity;
     }
 
+    const totalFiltered = totalSnoozed + totalCapped + totalVelocity;
     if (totalFiltered > 0) {
-      console.log(`[FeedForge] Filtered ${totalFiltered} videos from response`);
+      console.log(`[FeedForge] Filtered ${totalFiltered} videos (snoozed: ${totalSnoozed}, capped: ${totalCapped}, velocity: ${totalVelocity})`);
 
-      // Notify content script of stats
+      // Notify content script of stats with per-filter breakdown
+      // Detail is JSON-stringified to cross the MAIN/ISOLATED world boundary
       window.dispatchEvent(
         new CustomEvent('feedforge-main-to-content', {
-          detail: {
+          detail: JSON.stringify({
             type: 'FILTER_STATS',
-            payload: { filtered: totalFiltered },
-          },
+            payload: {
+              snoozed: totalSnoozed,
+              capped: totalCapped,
+              velocity: totalVelocity,
+            },
+          }),
         })
       );
     }
 
+    // ── Schema validation ────────────────────────────────────────────────
+    validateSchema(url, body, processed);
+
     return processed;
+  }
+
+  // ─── Schema Validation ─────────────────────────────────────────────────────
+
+  /**
+   * Validate that YouTube's response JSON still has the structure we expect.
+   * Only flags when we find a known container (e.g. twoColumnBrowseResultsRenderer)
+   * but the inner video renderers are missing or have changed fields.
+   */
+  function validateSchema(
+    url: string,
+    originalBody: Record<string, unknown>,
+    _processed: Record<string, unknown>
+  ): void {
+    const issues: string[] = [];
+    let wasRelevantResponse = false;
+    let foundVideos = false;
+
+    // ── Check browse/home page structure ──────────────────────────────────
+    const twoCol = (originalBody as Record<string, unknown>)?.contents
+      ? ((originalBody as Record<string, unknown>).contents as Record<string, unknown>)
+          ?.twoColumnBrowseResultsRenderer as Record<string, unknown> | undefined
+      : undefined;
+
+    if (twoCol) {
+      wasRelevantResponse = true;
+      const tabs = twoCol.tabs as Array<Record<string, unknown>> | undefined;
+      if (!Array.isArray(tabs)) {
+        issues.push('browse: tabs array missing');
+      } else {
+        for (const tab of tabs) {
+          const grid = (tab?.tabRenderer as Record<string, unknown>)?.content
+            ? ((tab.tabRenderer as Record<string, unknown>).content as Record<string, unknown>)
+                ?.richGridRenderer as Record<string, unknown> | undefined
+            : undefined;
+          if (grid) {
+            const contents = grid.contents as Array<Record<string, unknown>> | undefined;
+            if (!Array.isArray(contents)) {
+              issues.push('browse: richGridRenderer.contents missing');
+            } else {
+              // Check first few items for video renderers
+              for (const item of contents.slice(0, 10)) {
+                const vr = (item?.richItemRenderer as Record<string, unknown>)?.content
+                  ? ((item.richItemRenderer as Record<string, unknown>).content as Record<string, unknown>)
+                      ?.videoRenderer as Record<string, unknown> | undefined
+                  : undefined;
+                if (vr) {
+                  foundVideos = true;
+                  if (!vr.videoId) issues.push('video: missing videoId');
+                  if (!vr.title) issues.push('video: missing title');
+                  if (!vr.longBylineText && !vr.shortBylineText) issues.push('video: missing byline (channel)');
+                  break;
+                }
+              }
+              if (!foundVideos && contents.length > 3) {
+                issues.push('browse: no videoRenderer found in grid items');
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // ── Check continuation items ──────────────────────────────────────────
+    const actions = (
+      originalBody.onResponseReceivedActions ?? originalBody.onResponseReceivedEndpoints
+    ) as Array<Record<string, unknown>> | undefined;
+
+    if (Array.isArray(actions)) {
+      for (const action of actions) {
+        const ciSource = action?.appendContinuationItemsAction ?? action?.reloadContinuationItemsCommand;
+        const ci = ciSource as Record<string, unknown> | undefined;
+        if (ci) {
+          wasRelevantResponse = true;
+          const items = ci.continuationItems as Array<Record<string, unknown>> | undefined;
+          if (!Array.isArray(items)) {
+            issues.push('continuation: items array missing');
+          } else {
+            for (const item of items.slice(0, 10)) {
+              const vr = (item?.richItemRenderer as Record<string, unknown>)?.content
+                ? ((item.richItemRenderer as Record<string, unknown>).content as Record<string, unknown>)
+                    ?.videoRenderer as Record<string, unknown> | undefined
+                : undefined;
+              if (vr) {
+                foundVideos = true;
+                if (!vr.videoId) issues.push('video: missing videoId');
+                break;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // ── Check watch next sidebar ──────────────────────────────────────────
+    const watchNextContainer = (originalBody as Record<string, unknown>)?.contents
+      ? ((originalBody as Record<string, unknown>).contents as Record<string, unknown>)
+          ?.twoColumnWatchNextResults as Record<string, unknown> | undefined
+      : undefined;
+
+    if (watchNextContainer) {
+      wasRelevantResponse = true;
+      const secondary = (watchNextContainer.secondaryResults as Record<string, unknown>)
+        ?.secondaryResults as Record<string, unknown> | undefined;
+      if (secondary) {
+        const results = secondary.results as Array<Record<string, unknown>> | undefined;
+        if (!Array.isArray(results)) {
+          issues.push('watchNext: results array missing');
+        } else {
+          for (const item of results.slice(0, 5)) {
+            if ((item as Record<string, unknown>)?.compactVideoRenderer) {
+              foundVideos = true;
+              const cvr = (item as Record<string, unknown>).compactVideoRenderer as Record<string, unknown>;
+              if (!cvr.videoId) issues.push('video: missing videoId');
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    // ── Update health tracker ─────────────────────────────────────────────
+    if (!wasRelevantResponse) return; // Not a response we validate (e.g. search, reel)
+
+    schemaTracker.totalChecked++;
+    const uniqueIssues = [...new Set(issues)];
+
+    if (foundVideos && uniqueIssues.length === 0) {
+      // Fully healthy
+      schemaTracker.consecutiveFailures = 0;
+      schemaTracker.lastIssues = [];
+    } else if (foundVideos && uniqueIssues.length > 0) {
+      // Found videos but some fields missing — degraded
+      schemaTracker.consecutiveFailures++;
+      schemaTracker.lastIssues = uniqueIssues;
+      console.warn('[FeedForge] Schema degraded:', uniqueIssues);
+    } else {
+      // No videos found where expected — broken
+      schemaTracker.consecutiveFailures++;
+      schemaTracker.lastIssues = uniqueIssues.length > 0 ? uniqueIssues : ['No video renderers found in expected location'];
+      console.error('[FeedForge] Schema broken:', schemaTracker.lastIssues);
+    }
+
+    dispatchHealthEvent();
   }
 
   // ─── Filter Helpers (inline, since we can't import modules in MAIN world) ──
@@ -221,13 +421,15 @@ export default defineUnlistedScript(() => {
     items: Array<Record<string, unknown>>,
     settings: Record<string, unknown>,
     snoozes: Array<{ id: string; type: string; expiresAt: number }>
-  ): { items: Array<Record<string, unknown>>; filtered: number } {
+  ): { items: Array<Record<string, unknown>>; snoozed: number; capped: number; velocity: number } {
     // Extract video renderers, apply filters, reconstruct
     const now = Date.now();
     const activeSnoozes = snoozes.filter((s) => s.expiresAt > now);
     const channelCounts = new Map<string, number>();
     const maxPerChannel = (settings.maxVideosPerChannel as number) ?? 2;
-    let filtered = 0;
+    let snoozed = 0;
+    let capped = 0;
+    let velocity = 0;
 
     const result = items.filter((item) => {
       const richItem = item?.richItemRenderer as Record<string, unknown> | undefined;
@@ -249,7 +451,7 @@ export default defineUnlistedScript(() => {
             (snooze.type === 'channel' && snooze.id === channelId) ||
             (snooze.type === 'keyword' && title.includes(snooze.id.toLowerCase()))
           ) {
-            filtered++;
+            snoozed++;
             return false;
           }
         }
@@ -261,7 +463,7 @@ export default defineUnlistedScript(() => {
         if (channelKey) {
           const count = channelCounts.get(channelKey) ?? 0;
           if (count >= maxPerChannel) {
-            filtered++;
+            capped++;
             return false;
           }
           channelCounts.set(channelKey, count + 1);
@@ -274,19 +476,19 @@ export default defineUnlistedScript(() => {
         const hoursAgo = parseAge(
           (video.publishedTimeText as Record<string, unknown>)?.simpleText as string | undefined
         );
-        const velocity = hoursAgo > 0 ? viewCount / hoursAgo : 0;
+        const velo = hoursAgo > 0 ? viewCount / hoursAgo : 0;
 
         if (settings.velocityMode === 'hide-viral') {
-          if (velocity > ((settings.viralThreshold as number) ?? 50000)) {
-            filtered++;
+          if (velo > ((settings.viralThreshold as number) ?? 50000)) {
+            velocity++;
             return false;
           }
         } else if (settings.velocityMode === 'gems-only') {
-          const meetsVelocity = velocity >= ((settings.gemMinVelocity as number) ?? 100);
+          const meetsVelocity = velo >= ((settings.gemMinVelocity as number) ?? 100);
           const isHidden = viewCount <= ((settings.gemMaxTotalViews as number) ?? 100000);
           const unknownAge = viewCount === 0 && hoursAgo === Infinity;
           if (!unknownAge && !(meetsVelocity && isHidden)) {
-            filtered++;
+            velocity++;
             return false;
           }
         }
@@ -295,19 +497,20 @@ export default defineUnlistedScript(() => {
       return true;
     });
 
-    return { items: result, filtered };
+    return { items: result, snoozed, capped, velocity };
   }
 
   function filterCompactVideoItems(
     items: Array<Record<string, unknown>>,
     settings: Record<string, unknown>,
     snoozes: Array<{ id: string; type: string; expiresAt: number }>
-  ): { items: Array<Record<string, unknown>>; filtered: number } {
+  ): { items: Array<Record<string, unknown>>; snoozed: number; capped: number; velocity: number } {
     const now = Date.now();
     const activeSnoozes = snoozes.filter((s) => s.expiresAt > now);
     const channelCounts = new Map<string, number>();
     const maxPerChannel = (settings.maxVideosPerChannel as number) ?? 2;
-    let filtered = 0;
+    let snoozed = 0;
+    let capped = 0;
 
     const result = items.filter((item) => {
       const video = item?.compactVideoRenderer as Record<string, unknown> | undefined;
@@ -325,7 +528,7 @@ export default defineUnlistedScript(() => {
             (snooze.type === 'channel' && snooze.id === channelId) ||
             (snooze.type === 'keyword' && title.includes(snooze.id.toLowerCase()))
           ) {
-            filtered++;
+            snoozed++;
             return false;
           }
         }
@@ -337,7 +540,7 @@ export default defineUnlistedScript(() => {
         if (channelKey) {
           const count = channelCounts.get(channelKey) ?? 0;
           if (count >= maxPerChannel) {
-            filtered++;
+            capped++;
             return false;
           }
           channelCounts.set(channelKey, count + 1);
@@ -347,7 +550,7 @@ export default defineUnlistedScript(() => {
       return true;
     });
 
-    return { items: result, filtered };
+    return { items: result, snoozed, capped, velocity: 0 };
   }
 
   // ─── Inline Parsers (can't import modules in MAIN world) ───────────────────

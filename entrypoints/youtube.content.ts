@@ -28,17 +28,34 @@ export default defineContentScript({
 
     // ── Step 3: Listen for filter stats from MAIN world ───────────────────
     window.addEventListener(MAIN_TO_CONTENT_EVENT, ((event: CustomEvent) => {
-      const data = event.detail;
+      // Detail is JSON-stringified to cross the MAIN/ISOLATED world boundary
+      let data: Record<string, unknown> | null = null;
+      try {
+        data = typeof event.detail === 'string' ? JSON.parse(event.detail) : event.detail;
+      } catch { /* ignore parse errors */ }
+
       if (data?.type === 'FILTER_STATS' && data?.payload) {
-        // Relay stats to background script
+        const payload = data.payload as Record<string, number>;
+        const { snoozed = 0, capped = 0, velocity = 0 } = payload;
+        // Relay per-filter breakdown to background script
         browser.runtime.sendMessage({
           type: 'INCREMENT_STATS',
           payload: {
-            intercepted: data.payload.filtered,
-            snoozed: 0,
-            capped: 0,
-            velocity: 0,
+            intercepted: snoozed + capped + velocity,
+            snoozed,
+            capped,
+            velocity,
           },
+        }).catch(() => {
+          // Background may not be ready yet
+        });
+      }
+
+      if (data?.type === 'SCHEMA_HEALTH' && data?.payload) {
+        // Relay schema health status to background script
+        browser.runtime.sendMessage({
+          type: 'REPORT_SCHEMA_HEALTH',
+          payload: data.payload,
         }).catch(() => {
           // Background may not be ready yet
         });
@@ -79,12 +96,13 @@ async function pushConfigToMainWorld(): Promise<void> {
     const settings = settingsResponse?.data ?? {};
     const snoozes = snoozesResponse?.data ?? [];
 
+    // Detail is JSON-stringified to cross the MAIN/ISOLATED world boundary
     window.dispatchEvent(
       new CustomEvent(CONTENT_TO_MAIN_EVENT, {
-        detail: {
+        detail: JSON.stringify({
           type: 'PIPELINE_CONFIG',
           payload: { settings, snoozes },
-        },
+        }),
       })
     );
   } catch (error) {

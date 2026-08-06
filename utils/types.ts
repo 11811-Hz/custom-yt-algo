@@ -171,3 +171,13 @@ export const DEFAULT_SETTINGS: FeedForgeSettings = {
   gemMinVelocity: 100, // 100 views/hour
   gemMaxTotalViews: 100000, // 100k total views
 };
+
+/** Schema health status — detects when YouTube changes their JSON format */
+export interface SchemaHealth {
+  status: 'healthy' | 'degraded' | 'broken';
+  issues: string[];
+  totalChecked: number;
+  consecutiveFailures: number;
+  lastCheckedAt: number;
+}
+

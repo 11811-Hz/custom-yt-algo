@@ -383,3 +383,23 @@ input[type="range"]::-webkit-slider-thumb:hover {
 .stagger-2 { animation-delay: 0.1s; }
 .stagger-3 { animation-delay: 0.15s; }
 .stagger-4 { animation-delay: 0.2s; }
+
+/* ─── Combobox Dropdown ───────────────────────────────────────────────────── */
+
+.combobox-dropdown {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-border) transparent;
+}
+
+.combobox-option {
+  transition: background 0.15s ease;
+}
+
+.combobox-option:hover:not(:disabled) {
+  background: var(--color-accent-glow) !important;
+}
+
+.combobox-option:last-child {
+  border-bottom: none !important;
+}
+
