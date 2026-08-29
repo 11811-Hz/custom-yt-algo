@@ -43,6 +43,11 @@ export function applyVelocityFilter(
     const hoursAgo = parsePublishedAgo(video.publishedTimeText?.simpleText);
     const velocity = calculateViewVelocity(viewCount, hoursAgo);
 
+    // If velocity is null (unknown age), keep the video conservatively.
+    // We don't want to silently filter videos just because their age
+    // couldn't be parsed.
+    if (velocity === null) return true;
+
     switch (settings.velocityMode) {
       case 'hide-viral':
         // Remove videos with velocity above threshold
@@ -60,10 +65,6 @@ export function applyVelocityFilter(
         ) {
           return true;
         }
-        // Also keep videos we can't calculate velocity for (no metadata)
-        if (viewCount === 0 && hoursAgo === Infinity) {
-          return true;
-        }
         removed++;
         return false;
 
@@ -74,3 +75,4 @@ export function applyVelocityFilter(
 
   return { kept, removed };
 }
+

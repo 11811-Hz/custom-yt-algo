@@ -32,8 +32,9 @@ export function parseViewCount(text: string | undefined): number {
       case 'm':
         return Math.round(num * 1_000_000);
       case 'b':
-      case 't':
         return Math.round(num * 1_000_000_000);
+      case 't':
+        return Math.round(num * 1_000_000_000_000);
       default:
         return Math.round(num);
     }
@@ -46,10 +47,11 @@ export function parseViewCount(text: string | undefined): number {
 
 /**
  * Parse a relative time string like "2 hours ago", "3 days ago", "1 month ago"
- * into hours elapsed.
+ * into hours elapsed. Returns null if the text cannot be parsed — callers must
+ * handle unknown age explicitly rather than treating it as Infinity.
  */
-export function parsePublishedAgo(text: string | undefined): number {
-  if (!text) return Infinity; // Unknown = treat as old
+export function parsePublishedAgo(text: string | undefined): number | null {
+  if (!text) return null; // Unknown — do NOT treat as old
 
   const cleaned = text.toLowerCase().trim();
 
@@ -60,7 +62,7 @@ export function parsePublishedAgo(text: string | undefined): number {
     if (cleaned.includes('just now') || cleaned.includes('moment')) {
       return 0.01; // Avoid division by zero
     }
-    return Infinity;
+    return null;
   }
 
   const amount = parseInt(match[1], 10);
@@ -82,15 +84,17 @@ export function parsePublishedAgo(text: string | undefined): number {
     case 'year':
       return amount * 24 * 365;
     default:
-      return Infinity;
+      return null;
   }
 }
 
 /**
  * Calculate view velocity: views per hour since publication.
+ * Returns null if age is unknown or zero — callers should treat null as
+ * "velocity cannot be determined" (conservative: keep the video).
  */
-export function calculateViewVelocity(viewCount: number, hoursAgo: number): number {
-  if (hoursAgo <= 0 || hoursAgo === Infinity) return 0;
+export function calculateViewVelocity(viewCount: number, hoursAgo: number | null): number | null {
+  if (hoursAgo === null || hoursAgo <= 0) return null;
   return Math.round(viewCount / hoursAgo);
 }
 

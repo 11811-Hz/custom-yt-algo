@@ -34,6 +34,18 @@ export default defineUnlistedScript(() => {
     lastIssues: [] as string[],
   };
 
+  /** Persistent channel cap state — survives across continuation responses */
+  const feedState = {
+    channelCounts: new Map<string, number>(),
+    currentUrl: '',
+  };
+
+  /** Reset feed state on YouTube SPA navigation */
+  window.addEventListener('yt-navigate-start', () => {
+    feedState.channelCounts.clear();
+    feedState.currentUrl = location.href;
+  });
+
   /** Dispatch schema health to content script */
   function dispatchHealthEvent() {
     const status = schemaTracker.consecutiveFailures === 0
@@ -71,7 +83,13 @@ export default defineUnlistedScript(() => {
     } catch { /* ignore parse errors */ }
     if (data?.type === 'PIPELINE_CONFIG') {
       pipelineConfig = data.payload as typeof pipelineConfig;
-      console.log('[FeedForge] Pipeline config updated', pipelineConfig);
+      const snoozeCount = pipelineConfig?.snoozes?.length ?? 0;
+      console.log(`[FeedForge] Pipeline config updated — ${snoozeCount} snooze(s)`, 
+        snoozeCount > 0 ? pipelineConfig?.snoozes : '(none)');
+
+      // Apply DOM-level filter for already-rendered videos
+      // (initial page load uses inline data, not fetch)
+      requestAnimationFrame(() => filterRenderedVideos());
     }
   }) as EventListener);
 
@@ -118,6 +136,98 @@ export default defineUnlistedScript(() => {
       return originalFetch.call(this, input, init);
     }
   };
+
+  // ─── Recursive Video Discovery ──────────────────────────────────────────────
+  //
+  // Instead of hardcoding paths like twoColumnBrowseResultsRenderer → tabs → ...
+  // we recursively walk the response tree and find arrays containing video
+  // renderer objects. This makes filtering resilient to YouTube restructuring
+  // the response JSON.
+
+  /** Known renderer keys that contain filterable video content */
+  const VIDEO_RENDERER_KEYS = new Set([
+    'videoRenderer',
+    'compactVideoRenderer',
+    'gridVideoRenderer',
+    'playlistVideoRenderer',
+    'reelItemRenderer',
+  ]);
+
+  interface DiscoveredArray {
+    array: Array<Record<string, unknown>>;
+    path: string;
+    rendererKey: string;
+  }
+
+  /**
+   * Recursively find all arrays in the response that contain video renderer
+   * objects. Returns references to the parent arrays so we can filter in-place.
+   */
+  function discoverVideoArrays(
+    obj: unknown,
+    path: string,
+    results: DiscoveredArray[],
+    visited: WeakSet<object>,
+    depth: number
+  ): void {
+    if (depth > 20 || obj === null || obj === undefined) return;
+    if (typeof obj !== 'object') return;
+    if (visited.has(obj as object)) return;
+    visited.add(obj as object);
+
+    if (Array.isArray(obj)) {
+      // Check if any element in this array has a video renderer key
+      for (const item of obj) {
+        if (item && typeof item === 'object' && !Array.isArray(item)) {
+          for (const key of VIDEO_RENDERER_KEYS) {
+            if (key in (item as Record<string, unknown>)) {
+              results.push({ array: obj as Array<Record<string, unknown>>, path, rendererKey: key });
+              return; // Don't recurse into this array further — we'll filter it
+            }
+          }
+          // Also check richItemRenderer -> content -> videoRenderer pattern
+          const richItem = (item as Record<string, unknown>).richItemRenderer as Record<string, unknown> | undefined;
+          if (richItem?.content) {
+            const content = richItem.content as Record<string, unknown>;
+            for (const key of VIDEO_RENDERER_KEYS) {
+              if (key in content) {
+                results.push({ array: obj as Array<Record<string, unknown>>, path, rendererKey: `richItem.${key}` });
+                return;
+              }
+            }
+          }
+        }
+      }
+      // Recurse into array elements
+      for (let i = 0; i < obj.length; i++) {
+        discoverVideoArrays(obj[i], `${path}[${i}]`, results, visited, depth + 1);
+      }
+    } else {
+      // Recurse into object properties
+      for (const key of Object.keys(obj as Record<string, unknown>)) {
+        discoverVideoArrays(
+          (obj as Record<string, unknown>)[key],
+          `${path}.${key}`,
+          results,
+          visited,
+          depth + 1
+        );
+      }
+    }
+  }
+
+  /**
+   * Extract the video renderer object from an array item, regardless of wrapper.
+   */
+  function extractVideoRenderer(item: Record<string, unknown>, rendererKey: string): Record<string, unknown> | null {
+    if (rendererKey.startsWith('richItem.')) {
+      const actualKey = rendererKey.slice('richItem.'.length);
+      const richItem = item.richItemRenderer as Record<string, unknown> | undefined;
+      const content = richItem?.content as Record<string, unknown> | undefined;
+      return (content?.[actualKey] as Record<string, unknown>) ?? null;
+    }
+    return (item[rendererKey] as Record<string, unknown>) ?? null;
+  }
 
   // ─── Response Processing ────────────────────────────────────────────────────
 
@@ -245,10 +355,36 @@ export default defineUnlistedScript(() => {
       totalVelocity += result.velocity;
     }
 
-    const totalFiltered = totalSnoozed + totalCapped + totalVelocity;
-    if (totalFiltered > 0) {
-      console.log(`[FeedForge] Filtered ${totalFiltered} videos (snoozed: ${totalSnoozed}, capped: ${totalCapped}, velocity: ${totalVelocity})`);
+    // ── Recursive discovery pass (catches anything the hardcoded paths miss) ──
+    const discoveredArrays: DiscoveredArray[] = [];
+    discoverVideoArrays(processed, 'root', discoveredArrays, new WeakSet(), 0);
 
+    let recursiveSnoozed = 0;
+    let recursiveCapped = 0;
+    let recursiveVelocity = 0;
+
+    for (const discovered of discoveredArrays) {
+      const result = filterDiscoveredArray(discovered, settings, snoozes);
+      recursiveSnoozed += result.snoozed;
+      recursiveCapped += result.capped;
+      recursiveVelocity += result.velocity;
+    }
+
+    totalSnoozed += recursiveSnoozed;
+    totalCapped += recursiveCapped;
+    totalVelocity += recursiveVelocity;
+
+    const totalFiltered = totalSnoozed + totalCapped + totalVelocity;
+
+    // ── Debug logging ─────────────────────────────────────────────────────
+    const endpoint = url.split('/youtubei/v1/')[1]?.split('?')[0] ?? url;
+    console.log(
+      `[FeedForge] ${endpoint}: discovered ${discoveredArrays.length} video array(s) ` +
+      `[${discoveredArrays.map(d => `${d.rendererKey}@${d.path}`).join(', ')}], ` +
+      `filtered ${totalFiltered} (snoozed:${totalSnoozed} capped:${totalCapped} velocity:${totalVelocity})`
+    );
+
+    if (totalFiltered > 0) {
       // Notify content script of stats with per-filter breakdown
       // Detail is JSON-stringified to cross the MAIN/ISOLATED world boundary
       window.dispatchEvent(
@@ -269,6 +405,102 @@ export default defineUnlistedScript(() => {
     validateSchema(url, body, processed);
 
     return processed;
+  }
+
+  // ─── Recursive Filter (for discovered arrays) ──────────────────────────────
+
+  function filterDiscoveredArray(
+    discovered: DiscoveredArray,
+    settings: Record<string, unknown>,
+    snoozes: Array<{ id: string; type: string; expiresAt: number }>
+  ): { snoozed: number; capped: number; velocity: number } {
+    const now = Date.now();
+    const activeSnoozes = snoozes.filter((s) => s.expiresAt > now);
+    const maxPerChannel = (settings.maxVideosPerChannel as number) ?? 2;
+    let snoozed = 0;
+    let capped = 0;
+    let velocity = 0;
+
+    // Filter in-place by splicing rejected items (iterate backwards)
+    for (let i = discovered.array.length - 1; i >= 0; i--) {
+      const item = discovered.array[i];
+      const video = extractVideoRenderer(item, discovered.rendererKey);
+      if (!video) continue; // Not a video item (continuation token, section header, etc.)
+
+      let shouldRemove = false;
+      let reason = '';
+
+      // ── Snooze check ──
+      if (!shouldRemove && activeSnoozes.length > 0) {
+        const videoId = video.videoId as string | undefined;
+        const channelId = getChannelId(video);
+        const channelName = getChannelName(video).toLowerCase();
+        const title = getTitle(video).toLowerCase();
+
+        for (const snooze of activeSnoozes) {
+          const keyword = snooze.id.toLowerCase();
+          if (
+            (snooze.type === 'video' && snooze.id === videoId) ||
+            (snooze.type === 'channel' && snooze.id === channelId) ||
+            (snooze.type === 'keyword' && (title.includes(keyword) || channelName.includes(keyword)))
+          ) {
+            shouldRemove = true;
+            reason = `snooze:${snooze.type}:${snooze.id}`;
+            snoozed++;
+            break;
+          }
+        }
+      }
+
+      // ── Channel cap check ──
+      if (!shouldRemove && settings.channelCapEnabled) {
+        const channelKey = getChannelId(video) || getChannelName(video);
+        if (channelKey) {
+          const count = feedState.channelCounts.get(channelKey) ?? 0;
+          if (count >= maxPerChannel) {
+            shouldRemove = true;
+            reason = `cap:${channelKey}`;
+            capped++;
+          } else {
+            feedState.channelCounts.set(channelKey, count + 1);
+          }
+        }
+      }
+
+      // ── Velocity check ──
+      if (!shouldRemove && settings.velocityEnabled && settings.velocityMode !== 'off') {
+        const viewCount = parseViews(getViewCountText(video));
+        const hoursAgo = parseAge(
+          (video.publishedTimeText as Record<string, unknown>)?.simpleText as string | undefined
+        );
+
+        if (hoursAgo !== null) {
+          const velo = hoursAgo > 0 ? viewCount / hoursAgo : 0;
+
+          if (settings.velocityMode === 'hide-viral') {
+            if (velo > ((settings.viralThreshold as number) ?? 50000)) {
+              shouldRemove = true;
+              reason = `viral:${Math.round(velo)}v/h`;
+              velocity++;
+            }
+          } else if (settings.velocityMode === 'gems-only') {
+            const meetsVelocity = velo >= ((settings.gemMinVelocity as number) ?? 100);
+            const isHidden = viewCount <= ((settings.gemMaxTotalViews as number) ?? 100000);
+            if (!(meetsVelocity && isHidden)) {
+              shouldRemove = true;
+              reason = `gems:${Math.round(velo)}v/h,${viewCount}v`;
+              velocity++;
+            }
+          }
+        }
+      }
+
+      if (shouldRemove) {
+        discovered.array.splice(i, 1);
+      }
+    }
+
+    return { snoozed, capped, velocity };
   }
 
   // ─── Schema Validation ─────────────────────────────────────────────────────
@@ -425,7 +657,6 @@ export default defineUnlistedScript(() => {
     // Extract video renderers, apply filters, reconstruct
     const now = Date.now();
     const activeSnoozes = snoozes.filter((s) => s.expiresAt > now);
-    const channelCounts = new Map<string, number>();
     const maxPerChannel = (settings.maxVideosPerChannel as number) ?? 2;
     let snoozed = 0;
     let capped = 0;
@@ -443,17 +674,25 @@ export default defineUnlistedScript(() => {
       if (activeSnoozes.length > 0) {
         const videoId = video.videoId as string | undefined;
         const channelId = getChannelId(video);
+        const channelName = getChannelName(video).toLowerCase();
         const title = getTitle(video).toLowerCase();
 
         for (const snooze of activeSnoozes) {
+          const keyword = snooze.id.toLowerCase();
           if (
             (snooze.type === 'video' && snooze.id === videoId) ||
             (snooze.type === 'channel' && snooze.id === channelId) ||
-            (snooze.type === 'keyword' && title.includes(snooze.id.toLowerCase()))
+            (snooze.type === 'keyword' && (title.includes(keyword) || channelName.includes(keyword)))
           ) {
+            console.log(`[FeedForge] Snoozed: "${title.slice(0, 50)}" (matched ${snooze.type}: "${snooze.id}")`);
             snoozed++;
             return false;
           }
+        }
+      } else {
+        // Log if no active snoozes (helps debug expired snoozes)
+        if (items.indexOf(item) === 0) {
+          console.log(`[FeedForge] No active snoozes (total snoozes received: ${snoozes.length})`);
         }
       }
 
@@ -461,12 +700,12 @@ export default defineUnlistedScript(() => {
       if (settings.channelCapEnabled) {
         const channelKey = getChannelId(video) || getChannelName(video);
         if (channelKey) {
-          const count = channelCounts.get(channelKey) ?? 0;
+          const count = feedState.channelCounts.get(channelKey) ?? 0;
           if (count >= maxPerChannel) {
             capped++;
             return false;
           }
-          channelCounts.set(channelKey, count + 1);
+          feedState.channelCounts.set(channelKey, count + 1);
         }
       }
 
@@ -476,6 +715,10 @@ export default defineUnlistedScript(() => {
         const hoursAgo = parseAge(
           (video.publishedTimeText as Record<string, unknown>)?.simpleText as string | undefined
         );
+
+        // Unknown age → unknown velocity → keep conservatively
+        if (hoursAgo === null) return true;
+
         const velo = hoursAgo > 0 ? viewCount / hoursAgo : 0;
 
         if (settings.velocityMode === 'hide-viral') {
@@ -486,8 +729,7 @@ export default defineUnlistedScript(() => {
         } else if (settings.velocityMode === 'gems-only') {
           const meetsVelocity = velo >= ((settings.gemMinVelocity as number) ?? 100);
           const isHidden = viewCount <= ((settings.gemMaxTotalViews as number) ?? 100000);
-          const unknownAge = viewCount === 0 && hoursAgo === Infinity;
-          if (!unknownAge && !(meetsVelocity && isHidden)) {
+          if (!(meetsVelocity && isHidden)) {
             velocity++;
             return false;
           }
@@ -507,7 +749,6 @@ export default defineUnlistedScript(() => {
   ): { items: Array<Record<string, unknown>>; snoozed: number; capped: number; velocity: number } {
     const now = Date.now();
     const activeSnoozes = snoozes.filter((s) => s.expiresAt > now);
-    const channelCounts = new Map<string, number>();
     const maxPerChannel = (settings.maxVideosPerChannel as number) ?? 2;
     let snoozed = 0;
     let capped = 0;
@@ -538,12 +779,12 @@ export default defineUnlistedScript(() => {
       if (settings.channelCapEnabled) {
         const channelKey = getChannelId(video) || getChannelName(video);
         if (channelKey) {
-          const count = channelCounts.get(channelKey) ?? 0;
+          const count = feedState.channelCounts.get(channelKey) ?? 0;
           if (count >= maxPerChannel) {
             capped++;
             return false;
           }
-          channelCounts.set(channelKey, count + 1);
+          feedState.channelCounts.set(channelKey, count + 1);
         }
       }
 
@@ -596,17 +837,23 @@ export default defineUnlistedScript(() => {
       switch (match[2]?.toLowerCase()) {
         case 'k': return Math.round(num * 1000);
         case 'm': return Math.round(num * 1000000);
-        case 'b': case 't': return Math.round(num * 1000000000);
+        case 'b': return Math.round(num * 1000000000);
+        case 't': return Math.round(num * 1000000000000);
         default: return Math.round(num);
       }
     }
     return Math.round(parseFloat(cleaned)) || 0;
   }
 
-  function parseAge(text: string | undefined): number {
-    if (!text) return Infinity;
+  function parseAge(text: string | undefined): number | null {
+    if (!text) return null;
     const match = text.toLowerCase().match(/(\d+)\s*(second|minute|hour|day|week|month|year)s?\s*ago/);
-    if (!match) return Infinity;
+    if (!match) {
+      if (text.toLowerCase().includes('just now') || text.toLowerCase().includes('moment')) {
+        return 0.01;
+      }
+      return null;
+    }
     const amount = parseInt(match[1], 10);
     switch (match[2]) {
       case 'second': return amount / 3600;
@@ -616,7 +863,215 @@ export default defineUnlistedScript(() => {
       case 'week': return amount * 168;
       case 'month': return amount * 720;
       case 'year': return amount * 8760;
-      default: return Infinity;
+      default: return null;
+    }
+  }
+
+  // ─── DOM-Level Filtering (fallback for server-side rendered content) ────────
+  //
+  // YouTube embeds the initial feed data inline in the HTML (ytInitialData),
+  // so fetch interception misses the first page load. This MutationObserver
+  // watches for rendered video elements and hides ones matching active filters.
+  //
+  // NOTE: YouTube's DOM uses yt-lockup-view-model for video cards (as of 2026).
+  // Title: h3 a (inside the lockup) or #video-title (legacy)
+  // Channel: yt-content-metadata-view-model a or #channel-name (legacy)
+
+  let domObserverStarted = false;
+
+  /**
+   * Extract title text from a video card element using multiple selector
+   * strategies to handle YouTube's evolving DOM structure.
+   */
+  function extractTitle(el: Element): string {
+    // New lockup model (2026+): title is in h3 > a
+    const lockupTitle = el.querySelector('yt-lockup-view-model h3 a');
+    if (lockupTitle?.textContent) return lockupTitle.textContent.trim();
+
+    // Try the lockup title class directly
+    const lockupTitleClass = el.querySelector('a[class*="lockup"][class*="title"], a[class*="Title"]');
+    if (lockupTitleClass?.textContent) return lockupTitleClass.textContent.trim();
+
+    // Legacy selectors
+    const legacyTitle = el.querySelector('#video-title, #video-title-link, a#video-title-link');
+    if (legacyTitle?.textContent) return legacyTitle.textContent.trim();
+
+    // Broadest fallback: any h3 text or aria-label on the element
+    const h3 = el.querySelector('h3');
+    if (h3?.textContent) return h3.textContent.trim();
+
+    const ariaLabel = el.getAttribute('aria-label') || el.querySelector('[aria-label]')?.getAttribute('aria-label');
+    if (ariaLabel) return ariaLabel.trim();
+
+    return '';
+  }
+
+  /**
+   * Extract channel name from a video card element.
+   */
+  function extractChannel(el: Element): string {
+    // New lockup model (2026+): channel is in yt-content-metadata-view-model
+    const metadataLink = el.querySelector('yt-content-metadata-view-model a');
+    if (metadataLink?.textContent) return metadataLink.textContent.trim();
+
+    // Try attributed string links in the metadata area
+    const attrLink = el.querySelector('.ytAttributedStringLink, a[class*="attributed"]');
+    if (attrLink?.textContent) return attrLink.textContent.trim();
+
+    // Legacy selectors
+    const legacyChannel = el.querySelector('#channel-name #text, ytd-channel-name #text, ytd-channel-name a');
+    if (legacyChannel?.textContent) return legacyChannel.textContent.trim();
+
+    // Fallback: any second link text (first is usually the title)
+    const allLinks = el.querySelectorAll('a[href*="/@"], a[href*="/channel/"]');
+    for (const link of allLinks) {
+      const text = link.textContent?.trim();
+      if (text && text.length > 0 && text.length < 80) return text;
+    }
+
+    return '';
+  }
+
+  function filterRenderedVideos(root?: Element): void {
+    if (!pipelineConfig) return;
+    const settings = pipelineConfig.settings as Record<string, unknown>;
+    if (!settings?.enabled) return;
+
+    const now = Date.now();
+    const snoozes = (pipelineConfig.snoozes as Array<{ id: string; type: string; expiresAt: number }>)
+      .filter((s) => s.expiresAt > now);
+
+    const hasSnoozes = snoozes.length > 0;
+    const hasChannelCap = !!settings.channelCapEnabled;
+    const maxPerChannel = (settings.maxVideosPerChannel as number) ?? 2;
+
+    // Nothing to filter at DOM level
+    if (!hasSnoozes && !hasChannelCap) return;
+
+    const container = root || document;
+
+    // Home feed items
+    const richItems = container.querySelectorAll(
+      'ytd-rich-item-renderer:not([data-feedforge-filtered])'
+    );
+
+    let hiddenCount = 0;
+    richItems.forEach((el) => {
+      el.setAttribute('data-feedforge-filtered', 'true');
+      const title = extractTitle(el).toLowerCase();
+      const channel = extractChannel(el).toLowerCase();
+
+      // ── Snooze check ──
+      if (hasSnoozes) {
+        for (const snooze of snoozes) {
+          const keyword = snooze.id.toLowerCase();
+          if (
+            (snooze.type === 'keyword' && (title.includes(keyword) || channel.includes(keyword))) ||
+            (snooze.type === 'channel' && channel === keyword)
+          ) {
+            (el as HTMLElement).style.display = 'none';
+            hiddenCount++;
+            console.log(`[FeedForge] DOM filter: hidden "${title.slice(0, 60)}" (matched: "${snooze.id}")`);
+            return;
+          }
+        }
+      }
+
+      // ── Channel cap check (DOM-level) ──
+      if (hasChannelCap && channel) {
+        const count = feedState.channelCounts.get(channel) ?? 0;
+        if (count >= maxPerChannel) {
+          (el as HTMLElement).style.display = 'none';
+          hiddenCount++;
+          return;
+        }
+        feedState.channelCounts.set(channel, count + 1);
+      }
+    });
+
+    // Watch sidebar items (compact video renderers)
+    const compactItems = container.querySelectorAll(
+      'ytd-compact-video-renderer:not([data-feedforge-filtered])'
+    );
+    compactItems.forEach((el) => {
+      el.setAttribute('data-feedforge-filtered', 'true');
+      const title = extractTitle(el).toLowerCase();
+      const channel = extractChannel(el).toLowerCase();
+
+      if (hasSnoozes) {
+        for (const snooze of snoozes) {
+          const keyword = snooze.id.toLowerCase();
+          if (
+            (snooze.type === 'keyword' && (title.includes(keyword) || channel.includes(keyword))) ||
+            (snooze.type === 'channel' && channel === keyword)
+          ) {
+            (el as HTMLElement).style.display = 'none';
+            hiddenCount++;
+            return;
+          }
+        }
+      }
+
+      if (hasChannelCap && channel) {
+        const count = feedState.channelCounts.get(channel) ?? 0;
+        if (count >= maxPerChannel) {
+          (el as HTMLElement).style.display = 'none';
+          hiddenCount++;
+          return;
+        }
+        feedState.channelCounts.set(channel, count + 1);
+      }
+    });
+
+    // Shorts shelf items
+    const shortsItems = container.querySelectorAll(
+      'ytd-reel-item-renderer:not([data-feedforge-filtered])'
+    );
+    shortsItems.forEach((el) => {
+      el.setAttribute('data-feedforge-filtered', 'true');
+      const title = (el.querySelector('#headline, [id*="title"]')?.textContent ?? '').toLowerCase();
+
+      if (hasSnoozes) {
+        for (const snooze of snoozes) {
+          if (snooze.type === 'keyword' && title.includes(snooze.id.toLowerCase())) {
+            (el as HTMLElement).style.display = 'none';
+            hiddenCount++;
+            return;
+          }
+        }
+      }
+    });
+
+    if (hiddenCount > 0) {
+      console.log(`[FeedForge] DOM filter pass: hidden ${hiddenCount} video(s)`);
+    }
+
+    // Start the MutationObserver for future additions (once)
+    if (!domObserverStarted && document.body) {
+      domObserverStarted = true;
+      const observer = new MutationObserver((mutations) => {
+        let hasNewItems = false;
+        for (const mutation of mutations) {
+          for (const node of mutation.addedNodes) {
+            if (node instanceof HTMLElement) {
+              if (
+                node.tagName === 'YTD-RICH-ITEM-RENDERER' ||
+                node.tagName === 'YTD-COMPACT-VIDEO-RENDERER' ||
+                node.tagName === 'YTD-REEL-ITEM-RENDERER' ||
+                node.querySelector?.('ytd-rich-item-renderer, ytd-compact-video-renderer, ytd-reel-item-renderer')
+              ) {
+                hasNewItems = true;
+              }
+            }
+          }
+        }
+        if (hasNewItems) {
+          // Debounce — wait for batch of elements to be added
+          requestAnimationFrame(() => filterRenderedVideos());
+        }
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+      console.log('[FeedForge] DOM observer started for initial/fallback filtering');
     }
   }
 

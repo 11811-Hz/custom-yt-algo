@@ -56,7 +56,7 @@ export async function updateSettings(
 
 /** Add a snooze entry */
 export async function addSnooze(
-  entry: Omit<SnoozeEntry, 'snoozedAt' | 'expiresAt'>
+  entry: Omit<SnoozeEntry, 'snoozedAt' | 'expiresAt' | 'duration'> & { duration?: number }
 ): Promise<void> {
   const settings = await getSettings();
   const now = Date.now();
